@@ -31,9 +31,9 @@ class Ledger {
   void transfer(const std::string& from, const std::string& to, int64_t amount,
                 const std::string& key_path);
 
-  // Drop spend records whose signature does not verify. An empty account
-  // checks every record. Returns one notice line per removed transaction.
-  std::vector<std::string> purge_illegal(const std::string& account);
+  // Drop spend records whose signature does not verify. Returns one notice
+  // line per removed transaction or rejected check index.
+  std::vector<std::string> purge_illegal();
 
   int64_t balance(const std::string& name) const;
   std::vector<ReplicaBalance> balance_from_all(const std::string& name) const;
@@ -47,6 +47,10 @@ class Ledger {
               const std::string& openssh_pub, const std::string& key_path);
 
   EtcdClient& client_;
+  // Set by purge_illegal. A following debit or transfer signs this checkpoint
+  // and commits it with the spend. -1 means this process has not audited yet.
+  int64_t audited_through_ = -1;
+  std::string audited_hash_;
 };
 
 }  // namespace sne

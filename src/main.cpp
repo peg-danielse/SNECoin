@@ -29,8 +29,8 @@ struct CurlGlobal {
   CurlGlobal& operator=(const CurlGlobal&) = delete;
 };
 
-void report_illegal(sne::Ledger& ledger, const std::string& account) {
-  for (const std::string& line : ledger.purge_illegal(account)) {
+void report_illegal(sne::Ledger& ledger) {
+  for (const std::string& line : ledger.purge_illegal()) {
     std::cerr << "snecoin: " << line << '\n';
   }
 }
@@ -289,7 +289,7 @@ int main(int argc, char** argv) {
       const CurlGlobal curl;
       sne::EtcdClient client{options};
       sne::Ledger ledger{client};
-      report_illegal(ledger, name);
+      report_illegal(ledger);
       if (command == "credit") {
         ledger.credit(name, *amount);
       } else {
@@ -319,8 +319,7 @@ int main(int argc, char** argv) {
       const CurlGlobal curl;
       sne::EtcdClient client{options};
       sne::Ledger ledger{client};
-      report_illegal(ledger, from);
-      report_illegal(ledger, to);
+      report_illegal(ledger);
       ledger.transfer(from, to, *amount, key_path);
       return 0;
     }
@@ -335,7 +334,7 @@ int main(int argc, char** argv) {
       const CurlGlobal curl;
       sne::EtcdClient client{options};
       sne::Ledger ledger{client};
-      report_illegal(ledger, name);
+      report_illegal(ledger);
       if (from_all) {
         bool failed = false;
         for (const sne::ReplicaBalance& row : ledger.balance_from_all(name)) {
@@ -358,7 +357,7 @@ int main(int argc, char** argv) {
       const CurlGlobal curl;
       sne::EtcdClient client{options};
       sne::Ledger ledger{client};
-      report_illegal(ledger, "");
+      report_illegal(ledger);
       for (const sne::AccountBalance& account : ledger.list()) {
         std::cout << account.name << ' ' << account.balance << '\n';
       }
@@ -382,7 +381,7 @@ int main(int argc, char** argv) {
       const CurlGlobal curl;
       sne::EtcdClient client{options};
       sne::Ledger ledger{client};
-      report_illegal(ledger, "");
+      report_illegal(ledger);
       for (const std::string& line : ledger.history(limit)) {
         std::cout << line << '\n';
       }

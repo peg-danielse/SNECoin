@@ -38,10 +38,41 @@ expect_reject "bob signing alice" "$SNE" transfer "$alice" "$bob" 5 --key "$WORK
 expect_reject "unsigned transfer" "$SNE" transfer "$alice" "$bob" 5
 expect_reject "bob debiting alice" "$SNE" debit "$alice" 5 --key "$WORKDIR/bob"
 
-alice_balance="$("$SNE" balance "$alice")"
-bob_balance="$("$SNE" balance "$bob")"
+alice_balance="$("$SNE" balance "$alice" 2>"$WORKDIR/first.err")"
+bob_balance="$("$SNE" balance "$bob" 2>"$WORKDIR/bob-first.err")"
 if [[ $alice_balance != 85 || $bob_balance != 55 ]]; then
   echo "key-auth: balances alice=$alice_balance bob=$bob_balance, expected 85 and 55" >&2
+  exit 1
+fi
+if [[ -s $WORKDIR/first.err || -s $WORKDIR/bob-first.err ]]; then
+  echo "key-auth: unexpected notice before tampering: $(cat "$WORKDIR/first.err" "$WORKDIR/bob-first.err")" >&2
+  exit 1
+fi
+
+python3 - <<'PY'
+import base64, json, urllib.request
+
+def b64(text):
+    return base64.b64encode(text.encode()).decode()
+
+def call(path, obj):
+    req = urllib.request.Request(
+        "http://127.0.0.1:2379" + path,
+        data=json.dumps(obj).encode(),
+        headers={"Content-Type": "application/json"},
+    )
+    with urllib.request.urlopen(req) as resp:
+        return json.load(resp)
+
+call("/v3/kv/put", {"key": b64("/sne/meta/checked"), "value": b64("tampered")})
+PY
+tampered_balance="$("$SNE" balance "$alice" 2>"$WORKDIR/index.err")"
+if [[ $tampered_balance != 85 ]]; then
+  echo "key-auth: tampered index changed alice=$tampered_balance" >&2
+  exit 1
+fi
+if ! grep -q "check index failed its signature check and was removed" "$WORKDIR/index.err"; then
+  echo "key-auth: missing check-index notice: $(cat "$WORKDIR/index.err")" >&2
   exit 1
 fi
 

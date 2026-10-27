@@ -68,6 +68,7 @@ All keys are UTF-8. Account names match `[A-Za-z0-9_.-]{1,64}`.
 | `/sne/acct/<name>` | Balance, ASCII base-10 `int64` |
 | `/sne/pub/<name>` | Account public key, one `ssh-ed25519` line |
 | `/sne/meta/seq` | Last assigned ledger sequence, ASCII base-10 integer |
+| `/sne/meta/checked` | `{"log":<seq>}` pointing at the spend that signed the check index |
 | `/sne/log/<seq>` | One ledger record, JSON |
 
 `<seq>` is the sequence number zero-padded to 20 digits, so key order and numeric order match. The first record uses sequence 1.
@@ -80,7 +81,7 @@ Ledger record:
 {"seq":1,"op":"transfer","from":"alice","to":"bob","amount":25}
 ```
 
-`op` is `open`, `credit`, `debit`, or `transfer`. `from` is present for `debit` and `transfer`. `to` is present for `open`, `credit`, and `transfer`. `amount` is the positive quantity applied by that operation. `open` stores the initial balance in `amount`. A spend also stores `revision` (the source account mod revision that was signed) and `sig` (standard base64 of the 64-byte signature). Records written before `revision` existed are left in place.
+`op` is `open`, `credit`, `debit`, or `transfer`. `from` is present for `debit` and `transfer`. `to` is present for `open`, `credit`, and `transfer`. `amount` is the positive quantity applied by that operation. `open` stores the initial balance in `amount`. A spend also stores `revision` (the source account mod revision that was signed) and `sig` (standard base64 of the 64-byte signature). A spend made after an audit also stores `checked` and `hash`: the last log sequence the client examined, and the SHA-256 of every log key and value up through that sequence. Records written before `revision` existed are left in place.
 
 ## Operations
 
@@ -112,9 +113,24 @@ snecoin/v1
 <mod_revision>
 ```
 
-`<mod_revision>` is the source account's current mod revision, so a captured signature fails the compare once that account changes. The transaction also compares the public-key key. A missing public key, a missing `--key`, or a signature that does not verify leaves the balances unchanged. `credit` and receiving a transfer do not require the recipient's key. The log record for a spend stores that revision and the signature.
+`<mod_revision>` is the source account's current mod revision, so a captured signature fails the compare once that account changes. The transaction also compares the public-key key. A missing public key, a missing `--key`, or a signature that does not verify leaves the balances unchanged. `credit` and receiving a transfer do not require the recipient's key.
 
-`balance`, `balance --from-all`, `list`, `history`, `credit`, `debit`, and `transfer` read the log before they do their own work. A `debit` or `transfer` that includes `revision` and whose `sig` does not verify against `/sne/pub/<from>` is illegal. `snecoin` prints one stderr line naming the sequence, the accounts, and the amount, then deletes that log key and reverses the balance change in one etcd transaction. `/sne/meta/seq` is not moved backward. `balance` and a one-account command only consider records that name that account. `list` and `history` consider every record. If the destination no longer holds the full amount, only the amount still there is returned to the source. There is no background watcher.
+A debit or transfer that follows an audit signs version 2 of that text. The two extra lines are the check index:
+
+```
+snecoin/v2
+<op>
+<from>
+<to>
+<amount>
+<mod_revision>
+<checked_seq>
+<sha256>
+```
+
+The same transaction writes `/sne/meta/checked` as `{"log":<this seq>}`. The index is trusted only when that log record's signature verifies and the SHA-256 of the log records through `<checked_seq>` still matches. A client that still has an older record verifies it as version 1, without those two lines.
+
+`balance`, `balance --from-all`, `list`, `history`, `credit`, `debit`, and `transfer` read the log before they do their own work. Records at or below a trusted index are not signature-checked again. Newer `debit` and `transfer` records are. One whose `sig` does not verify against `/sne/pub/<from>` is illegal. `snecoin` prints one stderr line naming the sequence, the accounts, and the amount, then deletes that log key and reverses the balance change in one etcd transaction. `/sne/meta/seq` is not moved backward. If the index is present but its signature does not verify, `snecoin` deletes the index and checks every record. If the hash no longer matches, it says so and checks every record. Only a later debit or transfer signs a new index. If the destination no longer holds the full amount, only the amount still there is returned to the source. There is no background watcher.
 
 ## Concurrency
 

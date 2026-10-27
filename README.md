@@ -85,7 +85,9 @@ snecoin/v1
 
 The log line stores that revision and the signature. `snecoin` checks the signature before it commits, so a spend signed with the wrong key never changes a balance.
 
-If a debit or transfer was written straight into etcd with a signature that does not verify, `snecoin` notices the next time someone inspects the ledger or moves funds: `balance`, `list`, `history`, `credit`, `debit`, or `transfer`. It prints one stderr line, deletes that log record, and puts the amount back when the accounts still hold it. `balance` only looks at records that name that account. `list` and `history` look at every record. There is no background watcher. Older log lines that have no signature are left as they are. The notice looks like this:
+A debit or transfer also signs a check index: the last log sequence examined, and a SHA-256 of the log up through that sequence. The index is stored at `/sne/meta/checked` and points at that signed log line. Later checks trust the index only when the signature still verifies and the hash still matches. Changing the index, or a log line it covers, fails that check. `snecoin` then checks every record again. Only another debit or transfer signs a fresh index.
+
+If a debit or transfer was written straight into etcd with a signature that does not verify, `snecoin` notices the next time someone inspects the ledger or moves funds: `balance`, `list`, `history`, `credit`, `debit`, or `transfer`. It prints one stderr line, deletes that log record, and puts the amount back when the accounts still hold it. There is no background watcher. Older log lines that have no signature are left as they are. The notice looks like this:
 
 ```
 snecoin: illegal transfer seq 12 from alice to bob amount 40 removed
@@ -128,6 +130,7 @@ Key and value bytes are standard base64. When `username` is set, `snecoin` sends
 | `/sne/acct/<name>` | Balance, decimal integer |
 | `/sne/pub/<name>` | One `ssh-ed25519` public key |
 | `/sne/meta/seq` | Last ledger sequence |
+| `/sne/meta/checked` | Pointer to the spend that signed the check index |
 | `/sne/log/<seq>` | One JSON record, sequence padded to 20 digits |
 
 A transfer is one transaction: compare the account revisions, the public key, and the sequence, then write the new balances, the next sequence, and the signed log line together. If another client wins the sequence key, `snecoin` waits a few milliseconds and retries. Removing an illegal record is also one transaction: delete `/sne/log/<seq>` and reverse the balances. The sequence counter stays where it is.

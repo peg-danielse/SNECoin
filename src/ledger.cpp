@@ -4,9 +4,13 @@
 #include "json.hpp"
 #include "sshkey.hpp"
 
+#include <openssl/evp.h>
+
+#include <algorithm>
 #include <cstdlib>
 #include <ctime>
 #include <limits>
+#include <map>
 #include <optional>
 #include <stdexcept>
 #include <unistd.h>
@@ -18,6 +22,7 @@ constexpr const char* kAccountPrefix = "/sne/acct/";
 constexpr const char* kPubPrefix = "/sne/pub/";
 constexpr const char* kLogPrefix = "/sne/log/";
 constexpr const char* kSeqKey = "/sne/meta/seq";
+constexpr const char* kCheckedKey = "/sne/meta/checked";
 constexpr int kMaxAttempts = 64;
 
 void backoff(int attempt) {
@@ -41,9 +46,14 @@ std::string account_key(const std::string& name) { return std::string{kAccountPr
 std::string pub_key(const std::string& name) { return std::string{kPubPrefix} + name; }
 
 std::string spend_message(const char* op, const std::string& from, const std::string& to,
-                          int64_t amount, int64_t revision) {
-  return std::string{"snecoin/v1\n"} + op + "\n" + from + "\n" + to + "\n" + std::to_string(amount) +
-         "\n" + std::to_string(revision) + "\n";
+                          int64_t amount, int64_t revision, int64_t checked,
+                          const std::string& hash) {
+  if (checked < 0) {
+    return std::string{"snecoin/v1\n"} + op + "\n" + from + "\n" + to + "\n" +
+           std::to_string(amount) + "\n" + std::to_string(revision) + "\n";
+  }
+  return std::string{"snecoin/v2\n"} + op + "\n" + from + "\n" + to + "\n" + std::to_string(amount) +
+         "\n" + std::to_string(revision) + "\n" + std::to_string(checked) + "\n" + hash + "\n";
 }
 
 std::string log_key(int64_t seq) {
@@ -104,7 +114,8 @@ void add_compare(TxnRequest& txn, const std::string& key, const KeyState& state)
 }
 
 std::string record_json(int64_t seq, const char* op, const std::string& from, const std::string& to,
-                        int64_t amount, int64_t signed_revision, const std::string& pubkey,
+                        int64_t amount, int64_t signed_revision, int64_t checked,
+                        const std::string& hash, const std::string& pubkey,
                         const std::string& signature) {
   std::string json = "{\"seq\":" + std::to_string(seq) + ",\"op\":\"" + op + "\"";
   if (!from.empty()) {
@@ -117,6 +128,9 @@ std::string record_json(int64_t seq, const char* op, const std::string& from, co
   if (signed_revision >= 0) {
     json += ",\"revision\":" + std::to_string(signed_revision);
   }
+  if (checked >= 0) {
+    json += ",\"checked\":" + std::to_string(checked) + ",\"hash\":\"" + hash + "\"";
+  }
   if (!pubkey.empty()) {
     json += ",\"pubkey\":\"" + pubkey + "\"";
   }
@@ -125,6 +139,98 @@ std::string record_json(int64_t seq, const char* op, const std::string& from, co
   }
   json += "}";
   return json;
+}
+
+std::optional<int64_t> log_seq(const std::string& key) {
+  constexpr size_t kWidth = 20;
+  const std::string prefix = kLogPrefix;
+  if (key.size() != prefix.size() + kWidth || key.compare(0, prefix.size(), prefix) != 0) {
+    return std::nullopt;
+  }
+  int64_t seq = 0;
+  for (size_t i = prefix.size(); i < key.size(); ++i) {
+    const char c = key[i];
+    if (c < '0' || c > '9') {
+      return std::nullopt;
+    }
+    const int digit = c - '0';
+    if (seq > (std::numeric_limits<int64_t>::max() - digit) / 10) {
+      return std::nullopt;
+    }
+    seq = seq * 10 + digit;
+  }
+  return seq;
+}
+
+std::string sha256_hex(const std::vector<const Kv*>& rows) {
+  EVP_MD_CTX* ctx = EVP_MD_CTX_new();
+  if (ctx == nullptr) {
+    throw std::runtime_error("sha256 failed");
+  }
+  struct Ctx {
+    EVP_MD_CTX* handle;
+    ~Ctx() { EVP_MD_CTX_free(handle); }
+  } md{ctx};
+  if (EVP_DigestInit_ex(md.handle, EVP_sha256(), nullptr) != 1) {
+    throw std::runtime_error("sha256 failed");
+  }
+  for (const Kv* row : rows) {
+    unsigned char len[8];
+    auto feed_len = [&](size_t n) {
+      for (int i = 7; i >= 0; --i) {
+        len[i] = static_cast<unsigned char>(n & 0xff);
+        n >>= 8;
+      }
+      if (EVP_DigestUpdate(md.handle, len, sizeof(len)) != 1) {
+        throw std::runtime_error("sha256 failed");
+      }
+    };
+    feed_len(row->key.size());
+    if (EVP_DigestUpdate(md.handle, row->key.data(), row->key.size()) != 1) {
+      throw std::runtime_error("sha256 failed");
+    }
+    feed_len(row->value.size());
+    if (EVP_DigestUpdate(md.handle, row->value.data(), row->value.size()) != 1) {
+      throw std::runtime_error("sha256 failed");
+    }
+  }
+  unsigned char digest[EVP_MAX_MD_SIZE];
+  unsigned int digest_len = 0;
+  if (EVP_DigestFinal_ex(md.handle, digest, &digest_len) != 1 || digest_len != 32) {
+    throw std::runtime_error("sha256 failed");
+  }
+  static constexpr char kHex[] = "0123456789abcdef";
+  std::string hex(64, '0');
+  for (unsigned int i = 0; i < digest_len; ++i) {
+    hex[i * 2] = kHex[digest[i] >> 4];
+    hex[i * 2 + 1] = kHex[digest[i] & 0xf];
+  }
+  return hex;
+}
+
+std::string hash_through(const RangeResult& logs, int64_t through) {
+  std::vector<const Kv*> rows;
+  for (const Kv& kv : logs.kvs) {
+    const std::optional<int64_t> seq = log_seq(kv.key);
+    if (!seq || *seq > through) {
+      continue;
+    }
+    rows.push_back(&kv);
+  }
+  std::sort(rows.begin(), rows.end(),
+            [](const Kv* left, const Kv* right) { return left->key < right->key; });
+  return sha256_hex(rows);
+}
+
+int64_t max_log_seq(const RangeResult& logs) {
+  int64_t max_seq = 0;
+  for (const Kv& kv : logs.kvs) {
+    const std::optional<int64_t> seq = log_seq(kv.key);
+    if (seq && *seq > max_seq) {
+      max_seq = *seq;
+    }
+  }
+  return max_seq;
 }
 
 struct IllegalSpend {
@@ -144,33 +250,37 @@ const Json* json_string(const Json& doc, const char* key) {
   return field;
 }
 
-bool signature_ok(const EtcdClient& client, const Json& doc, const std::string& op,
-                  const std::string& from, const std::string& to, int64_t amount,
-                  int64_t revision) {
-  const Json* sig = json_string(doc, "sig");
-  if (sig == nullptr) {
-    return false;
+const Ed25519Public* lookup_pub(const EtcdClient& client,
+                              std::map<std::string, std::optional<Ed25519Public>>& cache,
+                              const std::string& from) {
+  auto found = cache.find(from);
+  if (found == cache.end()) {
+    std::optional<Ed25519Public> parsed;
+    const KeyState pub = read_key(client, pub_key(from));
+    if (pub.present) {
+      try {
+        parsed = parse_public_key(pub.value);
+      } catch (const std::runtime_error&) {
+      }
+    }
+    found = cache.emplace(from, std::move(parsed)).first;
   }
-  std::string raw;
-  try {
-    raw = base64_decode(sig->text);
-  } catch (const std::runtime_error&) {
-    return false;
+  if (!found->second) {
+    return nullptr;
   }
-  const KeyState pub = read_key(client, pub_key(from));
-  if (!pub.present) {
-    return false;
-  }
-  try {
-    const Ed25519Public stored = parse_public_key(pub.value);
-    const std::string message = spend_message(op.c_str(), from, to, amount, revision);
-    return verify_ed25519(stored, message, raw);
-  } catch (const std::runtime_error&) {
-    return false;
-  }
+  return &(*found->second);
 }
 
-std::optional<IllegalSpend> illegal_spend(const EtcdClient& client, const Kv& kv) {
+bool signature_matches(const Ed25519Public& stored, const std::string& op, const std::string& from,
+                       const std::string& to, int64_t amount, int64_t revision, int64_t checked,
+                       const std::string& hash, const std::string& raw) {
+  const std::string message = spend_message(op.c_str(), from, to, amount, revision, checked, hash);
+  return verify_ed25519(stored, message, raw);
+}
+
+std::optional<IllegalSpend> illegal_spend(
+    const EtcdClient& client, std::map<std::string, std::optional<Ed25519Public>>& pubs,
+    const Kv& kv) {
   Json doc;
   try {
     doc = parse_json(kv.value);
@@ -209,8 +319,30 @@ std::optional<IllegalSpend> illegal_spend(const EtcdClient& client, const Kv& kv
     }
     to = to_field->text;
   }
-  if (signature_ok(client, doc, op->text, from->text, to, amount_n, revision_n)) {
+  const Json* sig = json_string(doc, "sig");
+  std::string raw;
+  if (sig != nullptr) {
+    try {
+      raw = base64_decode(sig->text);
+    } catch (const std::runtime_error&) {
+      raw.clear();
+    }
+  }
+  const Ed25519Public* stored = raw.empty() ? nullptr : lookup_pub(client, pubs, from->text);
+  if (stored != nullptr &&
+      signature_matches(*stored, op->text, from->text, to, amount_n, revision_n, -1, "", raw)) {
     return std::nullopt;
+  }
+  const Json* checked = doc.find("checked");
+  const Json* hash = json_string(doc, "hash");
+  if (stored != nullptr && checked != nullptr && hash != nullptr) {
+    try {
+      if (signature_matches(*stored, op->text, from->text, to, amount_n, revision_n, checked->i64(),
+                            hash->text, raw)) {
+        return std::nullopt;
+      }
+    } catch (const std::runtime_error&) {
+    }
   }
   IllegalSpend spend;
   spend.key = kv.key;
@@ -303,19 +435,114 @@ std::optional<std::string> undo_illegal(EtcdClient& client, const IllegalSpend& 
   throw std::runtime_error("commit conflicted too many times");
 }
 
+bool trustworthy_checkpoint(const EtcdClient& client, const std::string& meta_value, int64_t& seq,
+                            std::string& hash) {
+  Json meta;
+  try {
+    meta = parse_json(meta_value);
+  } catch (const std::runtime_error&) {
+    return false;
+  }
+  const Json* log_field = meta.find("log");
+  if (log_field == nullptr) {
+    return false;
+  }
+  int64_t log_seq_n = 0;
+  try {
+    log_seq_n = log_field->i64();
+  } catch (const std::runtime_error&) {
+    return false;
+  }
+  const KeyState log = read_key(client, log_key(log_seq_n));
+  if (!log.present) {
+    return false;
+  }
+  Json doc;
+  try {
+    doc = parse_json(log.value);
+  } catch (const std::runtime_error&) {
+    return false;
+  }
+  const Json* op = json_string(doc, "op");
+  const Json* from = json_string(doc, "from");
+  const Json* amount = doc.find("amount");
+  const Json* revision = doc.find("revision");
+  const Json* checked = doc.find("checked");
+  const Json* hash_field = json_string(doc, "hash");
+  const Json* sig = json_string(doc, "sig");
+  if (op == nullptr || from == nullptr || from->text.empty() || amount == nullptr ||
+      revision == nullptr || checked == nullptr || hash_field == nullptr || sig == nullptr) {
+    return false;
+  }
+  if (op->text != "debit" && op->text != "transfer") {
+    return false;
+  }
+  std::string to;
+  if (const Json* to_field = doc.find("to")) {
+    if (to_field->type != Json::Type::String) {
+      return false;
+    }
+    to = to_field->text;
+  }
+  std::string raw;
+  try {
+    raw = base64_decode(sig->text);
+    seq = checked->i64();
+    hash = hash_field->text;
+    const int64_t amount_n = amount->i64();
+    const int64_t revision_n = revision->i64();
+    std::map<std::string, std::optional<Ed25519Public>> pubs;
+    const Ed25519Public* stored = lookup_pub(client, pubs, from->text);
+    if (stored == nullptr) {
+      return false;
+    }
+    return signature_matches(*stored, op->text, from->text, to, amount_n, revision_n, seq, hash,
+                             raw);
+  } catch (const std::runtime_error&) {
+    return false;
+  }
+}
+
+bool delete_key(EtcdClient& client, const KeyState& state, const std::string& key) {
+  TxnRequest txn;
+  add_compare(txn, key, state);
+  txn.deletes.push_back(DeleteOp{key});
+  return client.txn(txn);
+}
+
 }  // namespace
 
-std::vector<std::string> Ledger::purge_illegal(const std::string& account) {
+std::vector<std::string> Ledger::purge_illegal() {
   std::vector<std::string> notes;
+  int64_t trusted_seq = 0;
+  std::string trusted_hash;
+  bool have_trust = false;
+  const KeyState meta = read_key(client_, kCheckedKey);
+  if (meta.present) {
+    if (trustworthy_checkpoint(client_, meta.value, trusted_seq, trusted_hash)) {
+      have_trust = true;
+    } else if (delete_key(client_, meta, kCheckedKey)) {
+      notes.push_back("check index failed its signature check and was removed");
+    }
+  }
+
+  bool announced_mismatch = false;
+  std::map<std::string, std::optional<Ed25519Public>> pubs;
   for (;;) {
     const RangeResult logs = client_.range_prefix(kLogPrefix);
+    const bool prefix_ok = have_trust && hash_through(logs, trusted_seq) == trusted_hash;
+    if (have_trust && !prefix_ok && !announced_mismatch) {
+      notes.push_back("check index does not match the log");
+      announced_mismatch = true;
+    }
     bool removed = false;
     for (const Kv& kv : logs.kvs) {
-      const std::optional<IllegalSpend> spend = illegal_spend(client_, kv);
-      if (!spend) {
+      const std::optional<int64_t> seq = log_seq(kv.key);
+      if (prefix_ok && seq && *seq <= trusted_seq) {
         continue;
       }
-      if (!account.empty() && spend->from != account && spend->to != account) {
+      const std::optional<IllegalSpend> spend = illegal_spend(client_, pubs, kv);
+      if (!spend) {
         continue;
       }
       const std::optional<std::string> note = undo_illegal(client_, *spend);
@@ -326,9 +553,12 @@ std::vector<std::string> Ledger::purge_illegal(const std::string& account) {
       removed = true;
       break;
     }
-    if (!removed) {
-      return notes;
+    if (removed) {
+      continue;
     }
+    audited_through_ = max_log_seq(logs);
+    audited_hash_ = hash_through(logs, audited_through_);
+    return notes;
   }
 }
 
@@ -432,13 +662,16 @@ void Ledger::mutate(Op op, const std::string& from, const std::string& to, int64
         break;
     }
 
+    const bool attest = spend && audited_through_ >= 0 && next_seq > audited_through_;
+    const int64_t checked = attest ? audited_through_ : -1;
     std::string signature;
     if (spend) {
       if (!pub.present) {
         throw std::runtime_error("account has no key: " + from);
       }
       const Ed25519Public stored = parse_public_key(pub.value);
-      const std::string message = spend_message(op_name, from, to, amount, src.mod_revision);
+      const std::string message = spend_message(op_name, from, to, amount, src.mod_revision,
+                                                checked, checked < 0 ? "" : audited_hash_);
       signature = sign_ed25519(signer, message);
       if (!verify_ed25519(stored, message, signature)) {
         throw std::runtime_error("signature rejected");
@@ -465,9 +698,13 @@ void Ledger::mutate(Op op, const std::string& from, const std::string& to, int64
     txn.success.push_back(PutOp{kSeqKey, std::to_string(next_seq)});
     txn.success.push_back(PutOp{
         log_key(next_seq),
-        record_json(next_seq, op_name, from, to, amount, spend ? src.mod_revision : -1,
-                    op == Op::Open ? openssh_pub : "",
+        record_json(next_seq, op_name, from, to, amount, spend ? src.mod_revision : -1, checked,
+                    checked < 0 ? "" : audited_hash_, op == Op::Open ? openssh_pub : "",
                     signature.empty() ? "" : base64_encode(signature))});
+    if (checked >= 0) {
+      txn.success.push_back(
+          PutOp{kCheckedKey, std::string{"{\"log\":"} + std::to_string(next_seq) + "}"});
+    }
 
     if (client_.txn(txn)) {
       return;
