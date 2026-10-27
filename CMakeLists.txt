@@ -14,13 +14,15 @@ if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
 endif()
 
 find_package(CURL REQUIRED)
+find_package(OpenSSL REQUIRED)
 
-add_executable(sne
+add_executable(snecoin
   src/main.cpp
   src/config.cpp
   src/etcd_client.cpp
-  src/ledger.cpp)
+  src/ledger.cpp
+  src/sshkey.cpp)
 
-target_compile_definitions(sne PRIVATE SNE_VERSION="${PROJECT_VERSION}")
-target_compile_options(sne PRIVATE -Wall -Wextra -Wpedantic)
-target_link_libraries(sne PRIVATE CURL::libcurl)
+target_compile_definitions(snecoin PRIVATE SNE_VERSION="${PROJECT_VERSION}")
+target_compile_options(snecoin PRIVATE -Wall -Wextra -Wpedantic)
+target_link_libraries(snecoin PRIVATE CURL::libcurl OpenSSL::Crypto)

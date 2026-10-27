@@ -30,9 +30,14 @@ struct PutOp {
   std::string value;
 };
 
+struct DeleteOp {
+  std::string key;
+};
+
 struct TxnRequest {
   std::vector<Compare> compare;
   std::vector<PutOp> success;
+  std::vector<DeleteOp> deletes;
 };
 
 struct ClientOptions {

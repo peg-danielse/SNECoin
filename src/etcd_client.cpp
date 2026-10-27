@@ -112,6 +112,12 @@ std::string build_txn(const TxnRequest& request) {
     body += "{\"request_put\":{\"key\":\"" + quote_b64(put.key) + "\",\"value\":\"" +
             quote_b64(put.value) + "\"}}";
   }
+  for (size_t i = 0; i < request.deletes.size(); ++i) {
+    if (i != 0 || !request.success.empty()) {
+      body += ',';
+    }
+    body += "{\"request_delete_range\":{\"key\":\"" + quote_b64(request.deletes[i].key) + "\"}}";
+  }
   body += "]}";
   return body;
 }

@@ -5,7 +5,7 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-SNE="${SNE:-$ROOT/build/sne}"
+SNE="${SNE:-$ROOT/build/snecoin}"
 INITIAL=100
 SKIP_INIT=0
 JOBS=1
@@ -62,8 +62,13 @@ if [[ $# -gt 0 ]]; then
 fi
 
 if [[ ! -x $SNE ]]; then
-  echo "bipartite: build sne first: cmake -S . -B build && cmake --build build" >&2
+  echo "bipartite: build snecoin first: cmake -S . -B build && cmake --build build" >&2
   exit 1
+fi
+LOAD_KEY="${SNE_LOAD_KEY:-/tmp/snecoin-etcd/load_ed25519}"
+mkdir -p "$(dirname "$LOAD_KEY")"
+if [[ ! -f $LOAD_KEY || ! -f ${LOAD_KEY}.pub ]]; then
+  ssh-keygen -t ed25519 -f "$LOAD_KEY" -N "" -C snecoin-load -q
 fi
 if [[ $SKIP_INIT -eq 0 ]]; then
   INITIAL="${POSITIONAL:-100}"
@@ -122,8 +127,8 @@ drain() {
 
 open_pair() {
   local i=$1
-  "$SNE" open "$(name a "$i")" "$INITIAL"
-  "$SNE" open "$(name b "$i")" "$INITIAL"
+  "$SNE" open "$(name a "$i")" "$INITIAL" --pubkey "${LOAD_KEY}.pub"
+  "$SNE" open "$(name b "$i")" "$INITIAL" --pubkey "${LOAD_KEY}.pub"
 }
 
 transfer_pair() {
@@ -132,8 +137,8 @@ transfer_pair() {
   from="$(name a "$i")"
   to="$(name b "$i")"
   amount="$("$SNE" balance "$from")"
-  "$SNE" transfer "$from" "$to" "$amount"
-  "$SNE" transfer "$to" "$from" "$amount"
+  "$SNE" transfer "$from" "$to" "$amount" --key "$LOAD_KEY"
+  "$SNE" transfer "$to" "$from" "$amount" --key "$LOAD_KEY"
 }
 
 if [[ $SKIP_INIT -eq 0 ]]; then

@@ -9,9 +9,9 @@ This document is the contract for the client.
 | Piece | Responsibility |
 | --- | --- |
 | etcd member | Stores the keyspace and replicates it with Raft |
-| `sne` | Submits balance changes and reads them back |
+| `snecoin` | Submits balance changes and reads them back |
 
-One `sne` process is enough. It is a client. Running more clients does not add replicas. Replicas are etcd members.
+One `snecoin` process is enough. It is a client. Running more clients does not add replicas. Replicas are etcd members. SNE is Security & Network Engineering.
 
 The etcd tree is `~/Documents/etcd` (etcd 3.7.0). The binaries are `~/Documents/etcd/bin/etcd`, `etcdctl`, and `etcdutl`. The client speaks HTTP to member client URLs. It does not spawn etcd.
 
@@ -40,7 +40,7 @@ A call uses the first configured member that answers. A committed key is readabl
 
 ## Client configuration
 
-`sne` reads a config file when one is present:
+`snecoin` reads a config file when one is present:
 
 1. `--config FILE`
 2. `./sne.conf`
@@ -55,9 +55,9 @@ cert = /path/to/client.pem
 key = /path/to/client-key.pem
 ```
 
-`endpoints` is a comma-separated list of client URLs. `https://` URLs are verified with `ca_cert` when that is set, and with the system trust store otherwise. `cert` and `key` are a client certificate pair. `username` and `password` are an etcd user. `sne` exchanges them for a token at `/v3/auth/authenticate` and sends that token in the `Authorization` header. `--endpoints` replaces `endpoints` from the file and leaves the credentials in place.
+`endpoints` is a comma-separated list of client URLs. `https://` URLs are verified with `ca_cert` when that is set, and with the system trust store otherwise. `cert` and `key` are a client certificate pair. `username` and `password` are an etcd user. `snecoin` exchanges them for a token at `/v3/auth/authenticate` and sends that token in the `Authorization` header. `--endpoints` replaces `endpoints` from the file and leaves the credentials in place.
 
-With no file, `sne` uses the three local client URLs above and does not authenticate. The etcd user must already be allowed to read and write `/sne/`. `sne` does not create users or roles. `./sne.conf` is the local file and stays out of git.
+With no file, `snecoin` uses the three local client URLs above and does not authenticate. The etcd user must already be allowed to read and write `/sne/`. `snecoin` does not create users or roles. `./sne.conf` is the local file and stays out of git.
 
 ## Key layout
 
@@ -66,6 +66,7 @@ All keys are UTF-8. Account names match `[A-Za-z0-9_.-]{1,64}`.
 | Key | Value |
 | --- | --- |
 | `/sne/acct/<name>` | Balance, ASCII base-10 `int64` |
+| `/sne/pub/<name>` | Account public key, one `ssh-ed25519` line |
 | `/sne/meta/seq` | Last assigned ledger sequence, ASCII base-10 integer |
 | `/sne/log/<seq>` | One ledger record, JSON |
 
@@ -79,7 +80,7 @@ Ledger record:
 {"seq":1,"op":"transfer","from":"alice","to":"bob","amount":25}
 ```
 
-`op` is `open`, `credit`, `debit`, or `transfer`. `from` is present for `debit` and `transfer`. `to` is present for `open`, `credit`, and `transfer`. `amount` is the positive quantity applied by that operation. `open` stores the initial balance in `amount`.
+`op` is `open`, `credit`, `debit`, or `transfer`. `from` is present for `debit` and `transfer`. `to` is present for `open`, `credit`, and `transfer`. `amount` is the positive quantity applied by that operation. `open` stores the initial balance in `amount`. A spend also stores `revision` (the source account mod revision that was signed) and `sig` (standard base64 of the 64-byte signature). Records written before `revision` existed are left in place.
 
 ## Operations
 
@@ -87,18 +88,33 @@ Each mutation is one etcd transaction: compare, then write the new balance, the 
 
 | Command | Effect |
 | --- | --- |
-| `open <name> <amount>` | Create the account at `amount` |
+| `open <name> <amount> --pubkey FILE` | Create the account at `amount` and store its `ssh-ed25519` public key |
 | `balance <name>` | Print the balance |
 | `credit <name> <amount>` | Add `amount` |
-| `debit <name> <amount>` | Subtract `amount` when the balance covers it |
-| `transfer <from> <to> <amount>` | Move `amount` when the source covers it |
+| `debit <name> <amount> --key FILE` | Subtract `amount` when the balance covers it and the private key matches |
+| `transfer <from> <to> <amount> --key FILE` | Move `amount` when the source covers it and the private key matches |
 | `list` | Print every account and balance |
 | `history [n]` | Print the latest `n` log records, default 20 |
 | `balance <name> --from-all` | Read that account from every endpoint |
 
 `amount` is a base-10 integer greater than zero, except `open`, which accepts zero.
 
-`open` requires the account key to be absent. `credit`, `debit`, and `transfer` require the named accounts to exist. `transfer` requires two different accounts.
+`open` requires the account key to be absent and stores `/sne/pub/<name>`. `credit`, `debit`, and `transfer` require the named accounts to exist. `transfer` requires two different accounts.
+
+A `debit` or `transfer` is rejected unless `--key` holds the unencrypted `ssh-ed25519` private key for `/sne/pub/<from>`. `snecoin` signs this text, then checks the signature before the etcd transaction:
+
+```
+snecoin/v1
+<op>
+<from>
+<to>
+<amount>
+<mod_revision>
+```
+
+`<mod_revision>` is the source account's current mod revision, so a captured signature fails the compare once that account changes. The transaction also compares the public-key key. A missing public key, a missing `--key`, or a signature that does not verify leaves the balances unchanged. `credit` and receiving a transfer do not require the recipient's key. The log record for a spend stores that revision and the signature.
+
+`balance`, `balance --from-all`, `list`, `history`, `credit`, `debit`, and `transfer` read the log before they do their own work. A `debit` or `transfer` that includes `revision` and whose `sig` does not verify against `/sne/pub/<from>` is illegal. `snecoin` prints one stderr line naming the sequence, the accounts, and the amount, then deletes that log key and reverses the balance change in one etcd transaction. `/sne/meta/seq` is not moved backward. `balance` and a one-account command only consider records that name that account. `list` and `history` consider every record. If the destination no longer holds the full amount, only the amount still there is returned to the source. There is no background watcher.
 
 ## Concurrency
 
@@ -148,7 +164,7 @@ A missing sequence key uses `target` `CREATE`, `create_revision` `"0"`, instead 
 
 ## Process shape
 
-C++17. CMake target `sne`. libcurl issues the HTTP calls. The modules to add on top of this template:
+C++17. CMake target `snecoin`. libcurl issues the HTTP calls. The modules to add on top of this template:
 
 | Module | Job |
 | --- | --- |
@@ -161,4 +177,4 @@ Exit status `0` means the operation committed or the read succeeded. Exit status
 
 ## Out of scope
 
-Watches, compaction policy, wallets, signatures, and any consensus code inside `sne`. etcd already orders and replicates the keys.
+Watches, compaction policy, wallets, and any consensus code inside `snecoin`. etcd already orders and replicates the keys.

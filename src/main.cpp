@@ -29,18 +29,24 @@ struct CurlGlobal {
   CurlGlobal& operator=(const CurlGlobal&) = delete;
 };
 
+void report_illegal(sne::Ledger& ledger, const std::string& account) {
+  for (const std::string& line : ledger.purge_illegal(account)) {
+    std::cerr << "snecoin: " << line << '\n';
+  }
+}
+
 void print_usage(std::ostream& out) {
-  out << "sne " << SNE_VERSION << " — SNECoin ledger client\n"
+  out << "snecoin " << SNE_VERSION << " — Security & Network Engineering ledger\n"
       << "\n"
       << "Usage:\n"
-      << "  sne [--config FILE] [--endpoints URL[,URL...]] <command> [args]\n"
+      << "  snecoin [--config FILE] [--endpoints URL[,URL...]] <command> [args]\n"
       << "\n"
       << "Commands:\n"
-      << "  open <name> <amount>          Create an account\n"
+      << "  open <name> <amount> --pubkey FILE\n"
       << "  balance <name> [--from-all]   Print a balance, or read every member\n"
       << "  credit <name> <amount>        Add to an account\n"
-      << "  debit <name> <amount>         Subtract from an account\n"
-      << "  transfer <from> <to> <amount> Move value between accounts\n"
+      << "  debit <name> <amount> --key FILE\n"
+      << "  transfer <from> <to> <amount> --key FILE\n"
       << "  list                          Print every account\n"
       << "  history [n]                   Print the latest n records (default 20)\n"
       << "  version                       Print the client version\n"
@@ -49,7 +55,9 @@ void print_usage(std::ostream& out) {
       << "Default endpoints: " << kDefaultEndpoints << "\n"
       << "A config file overrides those endpoints and can set username, password,\n"
       << "ca_cert, cert, and key. Search order: --config, ./sne.conf,\n"
-      << "~/.config/sne/config. The repo file is sne.conf.\n";
+      << "~/.config/sne/config. The repo file is sne.conf.\n"
+      << "open stores an ssh-ed25519 public key. debit and transfer are rejected\n"
+      << "unless --key signs them with the matching private key.\n";
 }
 
 sne::ClientOptions resolve_options(bool endpoints_set, const std::string& endpoints_value,
@@ -74,7 +82,7 @@ sne::ClientOptions resolve_options(bool endpoints_set, const std::string& endpoi
 }
 
 int fail_args(const std::string& message) {
-  std::cerr << "sne: " << message << '\n';
+  std::cerr << "snecoin: " << message << '\n';
   return 2;
 }
 
@@ -130,6 +138,10 @@ int main(int argc, char** argv) {
   std::string command;
   std::vector<std::string> args;
   bool from_all = false;
+  std::string pubkey_path;
+  bool pubkey_set = false;
+  std::string key_path;
+  bool key_set = false;
 
   for (int i = 1; i < argc; ++i) {
     const std::string_view arg{argv[i]};
@@ -138,11 +150,37 @@ int main(int argc, char** argv) {
       return 0;
     }
     if (arg == "--version" || arg == "-V") {
-      std::cout << "sne " << SNE_VERSION << '\n';
+      std::cout << "snecoin " << SNE_VERSION << '\n';
       return 0;
     }
     if (arg == "--from-all") {
       from_all = true;
+      continue;
+    }
+    if (arg == "--pubkey") {
+      if (i + 1 >= argc) {
+        return fail_args("--pubkey requires a value");
+      }
+      pubkey_path = argv[++i];
+      pubkey_set = true;
+      continue;
+    }
+    if (arg.rfind("--pubkey=", 0) == 0) {
+      pubkey_path = std::string{arg.substr(std::string_view{"--pubkey="}.size())};
+      pubkey_set = true;
+      continue;
+    }
+    if (arg == "--key") {
+      if (i + 1 >= argc) {
+        return fail_args("--key requires a value");
+      }
+      key_path = argv[++i];
+      key_set = true;
+      continue;
+    }
+    if (arg.rfind("--key=", 0) == 0) {
+      key_path = std::string{arg.substr(std::string_view{"--key="}.size())};
+      key_set = true;
       continue;
     }
     if (arg == "--config") {
@@ -186,17 +224,17 @@ int main(int argc, char** argv) {
     return 2;
   }
   if (command == "help") {
-    if (!args.empty() || from_all) {
+    if (!args.empty() || from_all || key_set || pubkey_set) {
       return fail_args("unexpected argument");
     }
     print_usage(std::cout);
     return 0;
   }
   if (command == "version") {
-    if (!args.empty() || from_all) {
+    if (!args.empty() || from_all || key_set || pubkey_set) {
       return fail_args("unexpected argument");
     }
-    std::cout << "sne " << SNE_VERSION << '\n';
+    std::cout << "snecoin " << SNE_VERSION << '\n';
     return 0;
   }
   if (from_all && command != "balance") {
@@ -215,10 +253,16 @@ int main(int argc, char** argv) {
       if (!amount) {
         return fail_args("invalid amount");
       }
+      if (!pubkey_set) {
+        return fail_args("open requires --pubkey");
+      }
+      if (key_set) {
+        return fail_args("--key does not apply to open");
+      }
       const CurlGlobal curl;
       sne::EtcdClient client{options};
       sne::Ledger ledger{client};
-      ledger.open(name, *amount);
+      ledger.open(name, *amount, pubkey_path);
       return 0;
     }
     if (command == "credit" || command == "debit") {
@@ -230,13 +274,26 @@ int main(int argc, char** argv) {
       if (!amount) {
         return fail_args("invalid amount");
       }
+      if (command == "credit") {
+        if (key_set || pubkey_set) {
+          return fail_args("credit does not take a key");
+        }
+      } else {
+        if (!key_set) {
+          return fail_args("debit requires --key");
+        }
+        if (pubkey_set) {
+          return fail_args("--pubkey does not apply to debit");
+        }
+      }
       const CurlGlobal curl;
       sne::EtcdClient client{options};
       sne::Ledger ledger{client};
+      report_illegal(ledger, name);
       if (command == "credit") {
         ledger.credit(name, *amount);
       } else {
-        ledger.debit(name, *amount);
+        ledger.debit(name, *amount, key_path);
       }
       return 0;
     }
@@ -253,13 +310,24 @@ int main(int argc, char** argv) {
       if (!amount) {
         return fail_args("invalid amount");
       }
+      if (!key_set) {
+        return fail_args("transfer requires --key");
+      }
+      if (pubkey_set) {
+        return fail_args("--pubkey does not apply to transfer");
+      }
       const CurlGlobal curl;
       sne::EtcdClient client{options};
       sne::Ledger ledger{client};
-      ledger.transfer(from, to, *amount);
+      report_illegal(ledger, from);
+      report_illegal(ledger, to);
+      ledger.transfer(from, to, *amount, key_path);
       return 0;
     }
     if (command == "balance") {
+      if (key_set || pubkey_set) {
+        return fail_args("balance does not take a key");
+      }
       if (args.size() != 1) {
         return fail_args("balance requires <name>");
       }
@@ -267,13 +335,14 @@ int main(int argc, char** argv) {
       const CurlGlobal curl;
       sne::EtcdClient client{options};
       sne::Ledger ledger{client};
+      report_illegal(ledger, name);
       if (from_all) {
         bool failed = false;
         for (const sne::ReplicaBalance& row : ledger.balance_from_all(name)) {
           if (row.ok) {
             std::cout << row.endpoint << ' ' << row.balance << '\n';
           } else {
-            std::cerr << "sne: " << row.endpoint << ": " << row.error << '\n';
+            std::cerr << "snecoin: " << row.endpoint << ": " << row.error << '\n';
             failed = true;
           }
         }
@@ -283,18 +352,22 @@ int main(int argc, char** argv) {
       return 0;
     }
     if (command == "list") {
-      if (!args.empty()) {
+      if (!args.empty() || key_set || pubkey_set) {
         return fail_args("unexpected argument");
       }
       const CurlGlobal curl;
       sne::EtcdClient client{options};
       sne::Ledger ledger{client};
+      report_illegal(ledger, "");
       for (const sne::AccountBalance& account : ledger.list()) {
         std::cout << account.name << ' ' << account.balance << '\n';
       }
       return 0;
     }
     if (command == "history") {
+      if (key_set || pubkey_set) {
+        return fail_args("history does not take a key");
+      }
       int64_t limit = 20;
       if (args.size() > 1) {
         return fail_args("history takes at most one limit");
@@ -309,6 +382,7 @@ int main(int argc, char** argv) {
       const CurlGlobal curl;
       sne::EtcdClient client{options};
       sne::Ledger ledger{client};
+      report_illegal(ledger, "");
       for (const std::string& line : ledger.history(limit)) {
         std::cout << line << '\n';
       }
@@ -317,11 +391,11 @@ int main(int argc, char** argv) {
   } catch (const std::invalid_argument& error) {
     return fail_args(error.what());
   } catch (const std::exception& error) {
-    std::cerr << "sne: " << error.what() << '\n';
+    std::cerr << "snecoin: " << error.what() << '\n';
     return 1;
   }
 
-  std::cerr << "sne: unknown command '" << command << "'\n";
+  std::cerr << "snecoin: unknown command '" << command << "'\n";
   print_usage(std::cerr);
   return 2;
 }
