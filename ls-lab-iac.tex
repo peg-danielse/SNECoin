@@ -1,0 +1,164 @@
+\documentclass[11pt,a4paper]{exam}
+%\documentclass[answers,11pt,a4paper]{exam}
+
+%\usepackage{epsfig}
+%\usepackage{babel}
+\usepackage[pdftex, pdfborderstyle={/S/U/W 0}]{hyperref}
+%\usepackage{graphicx}
+\usepackage{multicol}
+\usepackage[utf8x]{inputenc}
+\usepackage{hyperref}
+
+\usepackage[all]{xy}
+%\usepackage{pdfpages}
+% Arno: Times
+\usepackage{mathptmx}
+%\usepackage{a4wide}
+
+
+\newcommand{\key}[1]{\textsf{#1}}
+\newcommand{\hkey}[1]{{\small\ensuremath{\langle\emph{#1}\rangle}}}
+\newcommand{\program}[1]{\texttt{#1}}
+%\newenvironment{comment}{\medskip\begin{minipage}{.4\textwidth} \sl \begin{center}}{\end{center}\end{minipage}}
+\newenvironment{comment}{\begin{center}\sl }{\end{center}}
+\newcommand{\enter}{{\small\ensuremath{\langle\emph{enter}\rangle}}}
+
+\newcommand{\question}[1]{\begin{itemize}\item[$Q:$]{#1}\end{itemize}}
+
+\newtheorem{task}{Task}
+
+\title{LS Lab Assignment:\\
+Configuration as Code }
+\author{Paul Danielse, \and{Shashikant Ilager}}
+
+\date{ Deadline: \\ December 17th, 2025 23:59 AoE \\ Feedback: \\ November 21th}
+
+%\addtolength{\hoffset}{-1cm}
+%\addtolength{\textwidth}{2cm}
+
+\begin{document}
+\ifprintanswers
+{\Huge ***CONTAINS ANSWERS!***}
+\fi
+\maketitle
+
+
+\begin{abstract}
+This lab assignment will introduce the concept of Infrastructure as Code.
+We use the hypervisor setup created in the first week of lab assignments to build our infrastructure programmatically. You can also use e.g. scripting, as long as the whole process stays automated. You should work alone on this assignment to demonstrate your understanding of the IaC concepts and tools.
+\end{abstract}
+%
+\section*{Version Control}
+With the Infrastructure as Code concept, the configuration of your infrastructure (servers, virtual machines, switches, routers) is maintained as a set of files. To properly manage the changing infrastructure over time it is useful to setup version control software. The master provides Git repositories and they can be found at \url{gitlab.os3.nl} but any from of repository (Bitbucket or GitHub) is acceptable. If you are unfamiliar with Git, read up on this first.
+
+\vspace{.2cm} \noindent \textit{Make sure the repository is set to private and no secrets will be leaked.}
+
+\begin{task}
+Form a group of 3 and create a new repository to store your configuration files. Later in the assignment your group will merge with another group to scale the cluster to 5 members (and optionally to as many student servers as possible).
+\begin{itemize}
+    \item Clone this repository on your desktop and on your server.
+    \item Commit a README.md file to the repository containing a basic plan for the project.
+    \item Make sure the lab teachers have read access to this repository.
+\end{itemize}
+\end{task}
+
+\section*{Basic Infrastructure}
+You are setting up the basic infrastructure an organization. You have registered
+the DNS domain \url{sne25.nl}, purchased a physical server, and installed a Linux system with KVM to host multiple virtual machines. Your goal is to create a small but functional environment that provides essential network services. Specifically, you will set up:
+
+\begin{itemize}
+    \item A DHCP server to, where possible, automatically assign IP addresses and network configurations to virtual machines on your network.
+    \item An authoritative DNS server for \url{sne25.nl} to manage name resolution within your domain.
+    \item An etcd\footnote{\url{https://github.com/etcd-io/etcd}} consensus server on one virtual machine, linked with other students' etcd servers via Raft~\cite{ongaro2014search}, and the SNECoin\footnote{\url{https://github.com/peg-danielse/SNECoin}} ledger client (\texttt{snecoin}) configured to use the shared cluster.
+    \item A web server that displays a webpage showing the current ledger accounts and recent transactions stored in etcd.
+\end{itemize}
+
+\question{Where should these services be located and distributed over virtual machines?}
+
+\noindent Create the infrastructure using only your scripts, do not make any manual changes on the VMs.
+
+\begin{task}
+    Using Ansible create the VMs to host the required services generated from inventory variables or a CSV file containing MAC addresses.
+
+    \vspace{.2cm} \noindent hint: Ansible has a \href{https://docs.ansible.com/ansible/devel/collections/community/libvirt/}{Libvirt module}.
+\end{task}
+
+\begin{task}
+Write configuration scripts that installs a DHCP service. for example the \href{https://www.isc.org/kea/}{Kea DHCP} is a secure and currently maintained DHCP service. Since this service will give out IP leases the DHCP server must be reachable from a static IP.
+\begin{itemize}
+    \item The mac-addresses of the Virtual Machines should be used for providing VM's with IP addresses.
+    \item Use an Ansible template (.j2) for the configuration files.
+\end{itemize}
+\end{task}
+
+\question{What services need a static IP?}
+
+\begin{task}
+Write the configuration script for the DNS. Think about future changes. The other service that will be configured need a domain name. At a minimum generate a zone file for your DNS server using a template and secure your DNS server appropriately. \\
+
+\noindent There are many DNS servers available. you are probably familliar with \href{https://bind9.readthedocs.io/en/v9.20.13/}{BIND9} and \href{https://www.unbound.org/}{Unbound}. The DNS used in Kubernetes is called \href{https://coredns.io/}{coreDNS} and has many plugins.
+\end{task}
+
+\begin{task}
+\textup{\textbf{Optional:}} Extend your DNS configuration to include a reverse DNS zone for your subnet.
+\end{task}
+
+\noindent Hint: \url{https://en.wikipedia.org/wiki/Zone\_file}
+
+\question{what are your next step if are going to scale up your system (ie. multiple web servers)?}
+
+\begin{task}
+Install etcd on one virtual machine on your server and build the SNECoin client (\texttt{snecoin}). Link your etcd node with the other students in your group of 3 to form a Raft cluster.
+
+\begin{itemize}
+    \item Let the etcd VM obtain its IP address via DHCP and give it a domain name in your DNS zone (for example \texttt{etcd1.sne25.nl}). Expose both the peer port (\texttt{2380}) for Raft communication between servers and the client port (\texttt{2379}) for \texttt{snecoin}.
+    \item Use an Ansible template (\texttt{.j2}) to generate \texttt{sne.conf} pointing at the DNS names of the group's etcd nodes. Do not commit passwords or private keys to git.
+    \item Generate an \texttt{ssh-ed25519} keypair, open an account with \texttt{snecoin open <name> <amount> --pubkey <file>}, and transfer funds to your group members with \texttt{--key}.
+    \item Verify with \texttt{snecoin balance <name> --from-all} that every student's etcd member returns the same balance, and run \texttt{scripts/key-auth.sh} to verify that unauthorized spends and forged log entries are rejected or rolled back.
+\end{itemize}
+\end{task}
+
+\question{Why is a single endpoint in \texttt{sne.conf} enough for \texttt{snecoin} to commit a transfer, and what role do the extra endpoints play?}
+
+\begin{task}
+Scale the etcd cluster and measure how Raft consensus behaves as the group grows:
+
+\begin{itemize}
+    \item \textbf{3 nodes:} Run \texttt{scripts/bipartite-transfers.sh --jobs 16} against your 3-student cluster and record how long it takes.
+    \item \textbf{5 nodes:} Link two more students' etcd servers into the cluster (5 members total), update \texttt{sne.conf} via Ansible, and run the benchmark again.
+    \item \textbf{Optional (as many as possible):} Link with as many student servers in the lab as possible to form one large etcd cluster. Run transfers and \texttt{balance --from-all} across all joined nodes.
+\end{itemize}
+\end{task}
+
+\question{How many server failures can a cluster of 3, 5, or $N$ nodes tolerate while still committing transactions? What happens to write latency and compare-and-swap retries as you add more nodes to the Raft cluster, and why?}
+
+\begin{task}
+Create the config for the web server. Let it show the current accounts and recent transactions stored in the shared etcd cluster using \texttt{snecoin list} and \texttt{snecoin history}.
+\end{task}
+
+\begin{task}
+Deploy the infrastructure, and show that your services work as expected.
+\end{task}
+
+\question{What steps would you need to make the configuration work out of the box on another students server?}
+
+\section*{Disaster Strikes}
+Please simulate the following scenarios:
+
+\begin{task}
+    Someone walks past the server and his feet unplug the power cable. Powering your system off while the rest of the group continues to run \texttt{snecoin} transfers. Verify whether the cluster keeps committing transactions, what happens when a majority of servers in the cluster are unplugged at the same time, and whether your node catches up automatically once powered back on.
+\end{task}
+
+\begin{task}
+    Someone deletes all your virtual machines.
+\end{task}
+
+\begin{task}
+    \textup{\textbf{Optional:}} Your disk breaks deleting all your data.
+\end{task}
+
+\bibliographystyle{plain}
+\bibliography{ref}
+
+\end{document}
+
